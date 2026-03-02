@@ -25,6 +25,12 @@ jobs:
       - name: Install dependencies
         run: uv sync
 
+      - name: Setup Kaggle API
+        run: |
+          mkdir -p $HOME/.kaggle
+          echo '${{ secrets.KAGGLE_API_TOKEN }}' > $HOME/.kaggle/access_token
+          chmod 600 $HOME/.kaggle/access_token
+
       - name: Run data fetching and merging script
         run: uv run python -m crypto_orderbook_dump.main --symbol ${{ matrix.pairs }}
 
@@ -32,5 +38,4 @@ jobs:
         run: |
           utc_date=$(date -u +"%Y-%m-%d")
           uv run kaggle datasets version -m "Automated daily update for $utc_date" -p ./data/parquet/${{ matrix.pairs }} --dir-mode zip
-        env:
-          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        
