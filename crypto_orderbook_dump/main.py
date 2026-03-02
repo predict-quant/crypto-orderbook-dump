@@ -53,6 +53,34 @@ def download_latest_dataset(dataset_slug, upload_dir):
     kaggle.api.dataset_download_files(dataset_slug, path=upload_dir, unzip=True)
 
 
+def create_dataset_on_kaggle(symbol: str, upload_dir: Path):
+    """Create a new dataset on Kaggle."""
+    try:
+        dataset_slug = f"gyroflaw/bybit-{symbol.lower()}-orderbook-snapshots"  # Kaggle dataset slug
+        metadata = {
+            "title": f"Bybit {symbol.upper()} Order Book Snapshots",
+            "id": dataset_slug,
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        # Save metadata to JSON file
+        metadata_path = upload_dir / "dataset-metadata.json"
+        with open(metadata_path, "w") as f:
+            import json
+
+            json.dump(metadata, f)
+
+        kaggle.api.dataset_create_new(
+            folder=upload_dir,
+            public=True,
+            convert_to_csv=False,
+            dir_mode="zip",
+            slug=dataset_slug,
+        )
+        print(f"Dataset {dataset_slug} created successfully on Kaggle.")
+    except Exception as e:
+        print(f"Error creating dataset: {e}")
+
+
 def main():
 
     args = parse_args()
@@ -71,12 +99,9 @@ def main():
     print("Downloading dataset metadata from Kaggle...")
     dataset_exist = download_latest_metadata(dataset_slug, upload_dir)
 
-    if not dataset_exist:
-        print("Dataset does not exist on Kaggle. Exiting.")
-        return
-
-    print("Downloading dataset from Kaggle...")
-    download_latest_dataset(dataset_slug, upload_dir)
+    if dataset_exist:
+        print("Downloading dataset from Kaggle...")
+        download_latest_dataset(dataset_slug, upload_dir)
 
     start_date: date | None = None
     if os.path.exists(upload_dir):
@@ -114,6 +139,10 @@ def main():
             4,
             False,
         )
+
+    if not dataset_exist:
+        print("Creating dataset on Kaggle...")
+        create_dataset_on_kaggle(symbol, upload_dir)
 
 
 if __name__ == "__main__":
