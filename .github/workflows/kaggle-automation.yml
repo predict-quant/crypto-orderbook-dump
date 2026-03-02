@@ -12,7 +12,7 @@ jobs:
   fetch-and-sync:
     strategy:
       matrix:
-        pairs: ['BTCUSDT','ETHUSDT','XRPUSDT','SOLUSDT']
+        pairs: ['BTCUSDT'] # 'ETHUSDT','XRPUSDT','SOLUSDT'
     runs-on: ubuntu-22.04
 
     steps:

@@ -69,15 +69,21 @@ def create_dataset_on_kaggle(symbol: str, upload_dir: Path):
 
             json.dump(metadata, f)
 
-        kaggle.api.dataset_create_new(
+        resp = kaggle.api.dataset_create_new(
             folder=upload_dir,
             public=True,
             convert_to_csv=False,
             dir_mode="zip",
         )
-        print(f"Dataset {dataset_slug} created successfully on Kaggle.")
+        if resp.error != "":
+            print(f"Dataset {dataset_slug} created successfully on Kaggle.")
+            return True
+        else:
+            print(f"Error creating dataset: {resp.error}")
     except Exception as e:
         print(f"Error creating dataset: {e}")
+    finally:
+        return False
 
 
 def main():
@@ -120,7 +126,7 @@ def main():
     if start_date is None:
         start_date = date(2025, 5, 1)
 
-    end_date = start_date + timedelta(days=3)
+    end_date = start_date + timedelta(days=30)
 
     for single_date in daterange(start_date, end_date):
         print(f"processing {single_date.strftime('%Y-%m-%d')}")
