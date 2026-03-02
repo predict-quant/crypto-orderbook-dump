@@ -39,7 +39,12 @@ Examples:
 
 def download_latest_metadata(dataset_slug, upload_dir):
     """Download the dataset metadata from Kaggle."""
-    kaggle.api.dataset_metadata(dataset_slug, path=upload_dir)
+    try:
+        kaggle.api.dataset_metadata(dataset_slug, path=upload_dir)
+        return True
+    except Exception as e:
+        print(f"Error downloading metadata: {e}")
+        return False
 
 
 def download_latest_dataset(dataset_slug, upload_dir):
@@ -62,8 +67,13 @@ def main():
         os.makedirs(upload_dir)
 
     # Step 1: Download the latest dataset and metadata from Kaggle
+
     print("Downloading dataset metadata from Kaggle...")
-    download_latest_metadata(dataset_slug, upload_dir)
+    dataset_exist = download_latest_metadata(dataset_slug, upload_dir)
+
+    if not dataset_exist:
+        print("Dataset does not exist on Kaggle. Exiting.")
+        return
 
     print("Downloading dataset from Kaggle...")
     download_latest_dataset(dataset_slug, upload_dir)
