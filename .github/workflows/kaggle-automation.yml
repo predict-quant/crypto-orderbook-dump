@@ -1,0 +1,36 @@
+name: Fetch and Merge Crypto Data
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  fetch-and-sync:
+    strategy:
+      matrix:
+        pairs: ['BTCUSDT','ETHUSDT','XRPUSDT','SOLUSDT']
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv with Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run data fetching and merging script
+        run: uv run python -m crypto_orderbook_dump.main --symbol ${{ matrix.pairs }}
+
+      - name: Upload data to Kaggle
+        run: |
+          utc_date=$(date -u +"%Y-%m-%d")
+          uv run kaggle datasets version -m "Automated daily update for $utc_date" -p ./data/parquet/${{ matrix.pairs }} --dir-mode zip
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}

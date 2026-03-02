@@ -15,7 +15,7 @@ import tempfile
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
@@ -150,7 +150,7 @@ def parse_interval(value: str) -> Tuple[int, str]:
     )
 
 
-def daterange(start: datetime, end: datetime) -> Iterable[datetime]:
+def daterange(start: date, end: date) -> Iterable[datetime]:
     """Yield each day between start and end inclusive."""
 
     current = start
@@ -183,6 +183,7 @@ def build_output_path(
     return (
         base_dir
         / symbol
+        / f"{date.year}"
         / f"{date_str}_{symbol}_ob200_{safe_interval}_{depth_tag}.parquet"
     )
 
@@ -343,7 +344,6 @@ def process_day(
 
     url = build_url(symbol, date)
     output_path = build_output_path(symbol, date, interval_label, depth, output_dir)
-
     status, temp_path = download_to_temp(url, temp_dir)
     if status == "not_found":
         return {"status": "not_found", "output": output_path}
@@ -368,8 +368,8 @@ def process_day(
 
 def process_symbol(
     symbol: str,
-    start: datetime,
-    end: datetime,
+    start: date,
+    end: date,
     output_dir: Path,
     temp_dir: Path,
     interval_ms: int,
@@ -381,17 +381,20 @@ def process_symbol(
     dry_run: bool,
 ) -> Dict[str, int]:
     """Handle the requested date span for a single symbol."""
+    symbol = symbol.upper()
 
     stats = {"converted": 0, "skipped": 0, "failed": 0, "missing": 0}
     dates = list(daterange(start, end))
 
     pending = []
-    for date in dates:
-        output_path = build_output_path(symbol, date, interval_label, depth, output_dir)
+    for date_to_process in dates:
+        output_path = build_output_path(
+            symbol, date_to_process, interval_label, depth, output_dir
+        )
         if output_path.exists():
             stats["skipped"] += 1
             continue
-        pending.append(date)
+        pending.append(date_to_process)
 
     print(f"  To process: {len(pending)}, Skipped: {stats['skipped']}")
 
