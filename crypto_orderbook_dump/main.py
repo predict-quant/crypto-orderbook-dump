@@ -37,17 +37,15 @@ Examples:
     return parser.parse_args()
 
 
-def download_latest_metadata(dataset_slug, symbol):
+def download_latest_metadata(dataset_slug, upload_dir):
     """Download the dataset metadata from Kaggle."""
-    kaggle.api.dataset_metadata(dataset_slug, path=DEFAULT_OUTPUT_DIR / symbol)
+    kaggle.api.dataset_metadata(dataset_slug, path=upload_dir)
 
 
-def download_latest_dataset(dataset_slug, symbol):
+def download_latest_dataset(dataset_slug, upload_dir):
     """Download the latest dataset from Kaggle."""
     # Use Kaggle Python API to download the dataset directly to memory
-    kaggle.api.dataset_download_files(
-        dataset_slug, path=DEFAULT_OUTPUT_DIR / symbol, unzip=True
-    )
+    kaggle.api.dataset_download_files(dataset_slug, path=upload_dir, unzip=True)
 
 
 def main():
@@ -58,23 +56,22 @@ def main():
     dataset_slug = (
         f"gyroflaw/bybit-{symbol.lower()}-orderbook-snapshots"  # Kaggle dataset slug
     )
-    upload_dir = "upload"
+    upload_dir = DEFAULT_OUTPUT_DIR / symbol
 
-    # Ensure the 'upload/' directory exists
     if not os.path.exists(upload_dir):
         os.makedirs(upload_dir)
 
     # Step 1: Download the latest dataset and metadata from Kaggle
     print("Downloading dataset metadata from Kaggle...")
-    download_latest_metadata(dataset_slug, symbol)  # Download metadata to 'upload/'
+    download_latest_metadata(dataset_slug, upload_dir)
 
     print("Downloading dataset from Kaggle...")
-    download_latest_dataset(dataset_slug, symbol)  # Download dataset to 'upload/'
+    download_latest_dataset(dataset_slug, upload_dir)
 
     start_date: date | None = None
-    if os.path.exists(DEFAULT_OUTPUT_DIR / symbol):
+    if os.path.exists(upload_dir):
         # List all files in the output directory for the symbol, and find the latest date
-        files = list((DEFAULT_OUTPUT_DIR / symbol).glob("*.parquet"))
+        files = list((upload_dir).glob("*.parquet"))
         if len(files) > 0:
             # File name format
             # data/parquet/BTCUSDT/2025-06-01_BTCUSDT_ob200_1m_depth10.parquet
