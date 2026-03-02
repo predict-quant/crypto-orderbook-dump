@@ -74,7 +74,6 @@ def create_dataset_on_kaggle(symbol: str, upload_dir: Path):
             public=True,
             convert_to_csv=False,
             dir_mode="zip",
-            slug=dataset_slug,
         )
         print(f"Dataset {dataset_slug} created successfully on Kaggle.")
     except Exception as e:
