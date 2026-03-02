@@ -183,7 +183,6 @@ def build_output_path(
     return (
         base_dir
         / symbol
-        / f"{date.year}"
         / f"{date_str}_{symbol}_ob200_{safe_interval}_{depth_tag}.parquet"
     )
 
