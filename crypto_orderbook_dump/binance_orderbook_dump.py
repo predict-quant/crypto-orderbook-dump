@@ -151,8 +151,9 @@ class BinanceOrderBookDumper:
                     df.write_parquet(out_path, compression="zstd", compression_level=19)
                     print(f"Wrote {len(self.buffers[symbol])} records to {out_path}")
                     # Reset buffer and snapshot for next batch
-                    last_records[symbol] = None
-                    snapshots[symbol] = None
+                    if is_new_day:
+                        last_records[symbol] = None
+                        snapshots[symbol] = None
                     self.buffers[symbol].clear()
 
     async def _send_pong(self, ws: websockets.ClientConnection):
