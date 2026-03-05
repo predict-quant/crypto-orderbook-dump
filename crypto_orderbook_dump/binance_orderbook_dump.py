@@ -133,13 +133,14 @@ class BinanceOrderBookDumper:
                 last_records[symbol] = record
 
                 # If record is for new day, write existing buffer to Parquet and clear buffer
-                last_record_day = date.fromtimestamp(last_record["E"] // 1000)
-                record_day = date.fromtimestamp(record["E"] // 1000)
+                is_new_day = False
+                if last_record is not None:
+                    last_record_day = date.fromtimestamp(last_record["E"] // 1000)
+                    record_day = date.fromtimestamp(record["E"] // 1000)
+                    if record_day != last_record_day:
+                        is_new_day = True
                 # Write to Parquet in batches
-                if (
-                    last_record_day != record_day
-                    or len(self.buffers[symbol]) >= self.batch_size
-                ):
+                if is_new_day or len(self.buffers[symbol]) >= self.batch_size:
                     # Use timestamp from first record in batch
                     ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
                     out_path = self._get_file_path(symbol, ts)
