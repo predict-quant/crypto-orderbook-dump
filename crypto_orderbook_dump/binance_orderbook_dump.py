@@ -199,6 +199,7 @@ class BinanceOrderBookDumper:
         out_path: Path = (
             self.output_dir / symbol / f"{date_str}_{symbol}_depth{self.depth}.parquet"
         )
+        print(f"Generated file path: {out_path}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         return out_path
