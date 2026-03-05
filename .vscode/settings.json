@@ -1,5 +1,4 @@
 {
-    "python.languageServer": "None",
     "[python]": {
         "editor.formatOnSave": true,
         "editor.codeActionsOnSave": {
