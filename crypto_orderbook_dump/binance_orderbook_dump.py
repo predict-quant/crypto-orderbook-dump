@@ -144,9 +144,20 @@ class BinanceOrderBookDumper:
                     # Use timestamp from first record in batch
                     ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
                     out_path = self._get_file_path(symbol, ts)
-                    df = pl.DataFrame(self.buffers[symbol])
+                    schema = {
+                        "e": pl.Utf8,
+                        "lastUpdateId": pl.UInt64,
+                        "E": pl.UInt64,
+                        "T": pl.UInt64,
+                        "U": pl.UInt64,
+                        "u": pl.UInt64,
+                        "pu": pl.UInt64,
+                        "bids": pl.Utf8,
+                        "asks": pl.Utf8,
+                    }
+                    df = pl.DataFrame(self.buffers[symbol], schema=schema)
                     if out_path.exists():
-                        df_existing = pl.read_parquet(out_path)
+                        df_existing = pl.read_parquet(out_path, schema=schema)
                         df = pl.concat([df_existing, df])
                     df.write_parquet(out_path, compression="zstd", compression_level=19)
                     print(f"Wrote {len(self.buffers[symbol])} records to {out_path}")
