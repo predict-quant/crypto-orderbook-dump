@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import os
 import time
 from datetime import date
 from os import PathLike
@@ -10,6 +11,10 @@ from pathlib import Path
 import aiohttp
 import polars as pl
 import websockets
+from dotenv import load_dotenv
+from huggingface_hub import login, upload_file
+
+load_dotenv()
 
 
 class BinanceOrderBookDumper:
@@ -28,6 +33,7 @@ class BinanceOrderBookDumper:
         self.buffers = {symbol: [] for symbol in symbols}
         self.output_dir = Path(output_dir)
         self.depth = depth
+        self.huggingface_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
         # Output paths will be generated per batch using timestamp
         self._stop = False
 
@@ -165,6 +171,12 @@ class BinanceOrderBookDumper:
                     if is_new_day:
                         last_records[symbol] = None
                         snapshots[symbol] = None
+                        # Upload to Hugging Face in background
+                        asyncio.create_task(
+                            self.upload_to_huggingface(
+                                out_path, delete_after_upload=True
+                            )
+                        )
                     self.buffers[symbol].clear()
 
     async def _send_pong(self, ws: websockets.ClientConnection):
@@ -203,6 +215,28 @@ class BinanceOrderBookDumper:
                 else:
                     print(f"Failed to get snapshot for {symbol}: {resp.status}")
                     return None
+
+    async def upload_to_huggingface(self, file_path: Path, delete_after_upload=False):
+        if not self.huggingface_token:
+            print("Hugging Face token not found. Skipping upload.")
+            return False
+        try:
+            login(token=self.huggingface_token)
+            upload_file(
+                path_or_fileobj=str(file_path),
+                path_in_repo=f"{file_path.parent.name}/{file_path.name}",
+                repo_id="predict-quant/binance-orderbook",
+                repo_type="dataset",
+            )
+
+            print(f"Uploaded {file_path} to Hugging Face.")
+            if delete_after_upload:
+                file_path.unlink()
+                print(f"Deleted local file {file_path} after upload.")
+            return True
+        except Exception as e:
+            print(f"Failed to upload {file_path} to Hugging Face: {e}")
+            return False
 
     def _get_file_path(self, symbol, timestamp) -> Path:
         dt = time.gmtime(timestamp // 1000)
