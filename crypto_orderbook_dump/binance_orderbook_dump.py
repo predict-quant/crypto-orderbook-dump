@@ -1,6 +1,7 @@
 # --- Class-based client with robust 24/7 operation ---
 import argparse
 import asyncio
+import functools
 import json
 import os
 import time
@@ -23,6 +24,9 @@ class BinanceOrderBookDumper:
     PING_INTERVAL = 60 * 2  # send pong every 2 minutes
     MAX_MSGS_PER_SEC = 10
 
+    MAX_UPLOAD_RETRIES = 3
+    UPLOAD_RETRY_DELAY = 30  # seconds between retries
+
     def __init__(
         self, symbols: list[str], depth: int, output_dir: PathLike, batch_size: int
     ):
@@ -34,6 +38,8 @@ class BinanceOrderBookDumper:
         self.output_dir = Path(output_dir)
         self.depth = depth
         self.huggingface_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
+        self._hf_logged_in = False
+        self._upload_tasks: set[asyncio.Task] = set()
         # Output paths will be generated per batch using timestamp
         self._stop = False
 
@@ -45,7 +51,15 @@ class BinanceOrderBookDumper:
         url = f"{self.BASE_URL}/stream?streams={streams}"
         return url
 
+    def _hf_login(self):
+        if not self._hf_logged_in and self.huggingface_token:
+            login(token=self.huggingface_token)
+            self._hf_logged_in = True
+
     async def run(self):
+        # Retry uploading any leftover files from previous runs
+        await self._retry_leftover_uploads()
+
         while not self._stop:
             try:
                 await self._run_once()
@@ -172,11 +186,13 @@ class BinanceOrderBookDumper:
                         last_records[symbol] = None
                         snapshots[symbol] = None
                         # Upload to Hugging Face in background
-                        asyncio.create_task(
+                        task = asyncio.create_task(
                             self.upload_to_huggingface(
                                 out_path, delete_after_upload=True
                             )
                         )
+                        self._upload_tasks.add(task)
+                        task.add_done_callback(self._upload_tasks.discard)
                     self.buffers[symbol].clear()
 
     async def _send_pong(self, ws: websockets.ClientConnection):
@@ -220,23 +236,57 @@ class BinanceOrderBookDumper:
         if not self.huggingface_token:
             print("Hugging Face token not found. Skipping upload.")
             return False
-        try:
-            login(token=self.huggingface_token)
-            upload_file(
-                path_or_fileobj=str(file_path),
-                path_in_repo=f"{file_path.parent.name}/{file_path.name}",
-                repo_id="predict-quant/binance-orderbook",
-                repo_type="dataset",
-            )
 
-            print(f"Uploaded {file_path} to Hugging Face.")
-            if delete_after_upload:
-                file_path.unlink()
-                print(f"Deleted local file {file_path} after upload.")
-            return True
-        except Exception as e:
-            print(f"Failed to upload {file_path} to Hugging Face: {e}")
-            return False
+        loop = asyncio.get_running_loop()
+
+        for attempt in range(1, self.MAX_UPLOAD_RETRIES + 1):
+            try:
+                await loop.run_in_executor(
+                    None,
+                    functools.partial(self._upload_file_sync, file_path),
+                )
+                print(f"Uploaded {file_path} to Hugging Face.")
+                if delete_after_upload:
+                    file_path.unlink()
+                    print(f"Deleted local file {file_path} after upload.")
+                return True
+            except Exception as e:
+                print(
+                    f"[Attempt {attempt}/{self.MAX_UPLOAD_RETRIES}] "
+                    f"Failed to upload {file_path}: {e}"
+                )
+                if attempt < self.MAX_UPLOAD_RETRIES:
+                    await asyncio.sleep(self.UPLOAD_RETRY_DELAY * attempt)
+
+        print(
+            f"Giving up uploading {file_path} after {self.MAX_UPLOAD_RETRIES} attempts."
+        )
+        return False
+
+    def _upload_file_sync(self, file_path: Path):
+        """Synchronous upload, safe to call from run_in_executor."""
+        self._hf_login()
+        upload_file(
+            path_or_fileobj=str(file_path),
+            path_in_repo=f"{file_path.parent.name}/{file_path.name}",
+            repo_id="predict-quant/binance-orderbook",
+            repo_type="dataset",
+        )
+
+    async def _retry_leftover_uploads(self):
+        """Upload parquet files left over from previous failed uploads."""
+        if not self.huggingface_token:
+            return
+        today_str = time.strftime("%Y-%m-%d", time.gmtime())
+        for symbol_dir in self.output_dir.iterdir():
+            if not symbol_dir.is_dir():
+                continue
+            for f in sorted(symbol_dir.glob("*.parquet")):
+                # Skip today's file — it may still be written to
+                if f.name.startswith(today_str):
+                    continue
+                print(f"[RETRY] Uploading leftover file {f}")
+                await self.upload_to_huggingface(f, delete_after_upload=True)
 
     def _get_file_path(self, symbol, timestamp) -> Path:
         dt = time.gmtime(timestamp // 1000)
