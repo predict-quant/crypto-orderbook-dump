@@ -34,11 +34,11 @@ class BinanceSpotOrderBookDumper:
     def __init__(
         self, symbols: list[str], depth: int, output_dir: PathLike, batch_size: int
     ):
-        self.symbols = symbols
+        self.symbols = [s.upper() for s in symbols]
         self.depth = depth
         self.output_dir = Path(output_dir)
         self.batch_size = batch_size
-        self.buffers = {symbol: [] for symbol in symbols}
+        self.buffers = {symbol: [] for symbol in self.symbols}
         self.huggingface_token = os.getenv("HUGGINGFACE_HUB_TOKEN")
         self._hf_logged_in = False
         self._upload_tasks: set[asyncio.Task] = set()
@@ -152,7 +152,7 @@ class BinanceSpotOrderBookDumper:
                 self._apply_record(symbol, record, snapshot, last_records)
 
                 # Flush buffer on new day or batch size reached
-                last_record = last_records.get(symbol)
+                _last_record = last_records.get(symbol)
                 is_new_day = False
                 prev_record = (
                     self.buffers[symbol][-1] if len(self.buffers[symbol]) > 1 else None
@@ -331,7 +331,6 @@ class BinanceSpotOrderBookDumper:
         out_path: Path = (
             self.output_dir / symbol / f"{date_str}_{symbol}_depth{self.depth}.parquet"
         )
-        print(f"Generated file path: {out_path}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
         return out_path
 
