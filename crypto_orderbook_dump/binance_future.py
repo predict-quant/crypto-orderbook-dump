@@ -80,120 +80,129 @@ class BinanceOrderBookDumper:
         last_records = {}
         first_event_processed = {symbol: False for symbol in self.symbols}
         async with websockets.connect(url, ping_interval=None) as ws:
+            # ping_interval=None disables client-initiated pings; the library
+            # still auto-responds to server ping frames with pong frames.
             print("WebSocket connection established.")
 
-            asyncio.create_task(self._send_pong(ws))
+            pong_task = asyncio.create_task(self._send_pong(ws))
+            try:
+                async for msg in ws:
+                    # Reconnect before 24h forced disconnect
+                    if time.time() - start_time > self.MAX_CONN_HOURS * 3600:
+                        print("Reconnecting before 24h forced disconnect.")
+                        break
 
-            async for msg in ws:
-                # Reconnect before 24h forced disconnect
-                if time.time() - start_time > self.MAX_CONN_HOURS * 3600:
-                    print("Reconnecting before 24h forced disconnect.")
-                    break
-
-                data = json.loads(msg)
-                payload = data.get("data", {})
-                stream = data.get("stream", "")
-                symbol = stream.split("@", 1)[0].upper()
-                if symbol not in self.buffers:
-                    continue
-                record = {
-                    "e": payload.get("e"),
-                    "lastUpdateId": None,
-                    "E": payload.get("E"),
-                    "T": payload.get("T"),
-                    "U": payload.get("U"),
-                    "u": payload.get("u"),
-                    "pu": payload.get("pu"),
-                    "bids": json.dumps(payload.get("b", [])),
-                    "asks": json.dumps(payload.get("a", [])),
-                }
-
-                snapshot = snapshots.get(symbol)
-                if snapshot is None:
-                    snapshot = await self._get_snapshot(symbol)
-                    if snapshot is not None:
-                        snapshots[symbol] = snapshot
-                        self.buffers[symbol].append(snapshot)
-                        print(f"Got initial snapshot for {symbol}")
-                    else:
-                        print(
-                            f"Failed to get initial snapshot for {symbol}, skipping updates until next attempt."
-                        )
+                    data = json.loads(msg)
+                    payload = data.get("data", {})
+                    stream = data.get("stream", "")
+                    symbol = stream.split("@", 1)[0].upper()
+                    if symbol not in self.buffers:
                         continue
-
-                # https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly
-                # How to manage a local order book correctly
-                # 4. Drop any event where u is < lastUpdateId in the snapshot.
-                if record["u"] <= snapshot["lastUpdateId"]:
-                    continue
-
-                # 5. The first processed event should have U <= lastUpdateId AND u >= lastUpdateId
-                # U = firstUpdateId (the first update ID) from the WebSocket stream.
-                # u = finalUpdateId (the last update ID) from the WebSocket stream.
-                # lastUpdateId = the update ID you got from the REST depth snapshot.
-                if (
-                    record["U"] <= snapshot["lastUpdateId"]
-                    and record["u"] >= snapshot["lastUpdateId"]
-                ):
-                    first_event_processed[symbol] = True
-                if not first_event_processed[symbol]:
-                    continue
-
-                # 6. While listening to the stream, each new event's pu should be equal to the previous event's u, otherwise initialize the process from step 3.
-                last_record = last_records.get(symbol)
-                if last_record is not None:
-                    if record["pu"] != last_record["u"]:
-                        print(
-                            f"Missing update for {symbol}: expected U={last_record['u'] + 1}, got U={record['U']}. Re-syncing snapshot."
-                        )
-                        snapshots[symbol] = None
-                        first_event_processed[symbol] = False
-                        continue
-                self.buffers[symbol].append(record)
-                last_records[symbol] = record
-
-                # If record is for new day, write existing buffer to Parquet and clear buffer
-                is_new_day = False
-                if last_record is not None:
-                    last_record_day = date.fromtimestamp(last_record["E"] // 1000)
-                    record_day = date.fromtimestamp(record["E"] // 1000)
-                    if record_day != last_record_day:
-                        is_new_day = True
-                # Write to Parquet in batches
-                if is_new_day or len(self.buffers[symbol]) >= self.batch_size:
-                    # Use timestamp from first record in batch
-                    ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
-                    out_path = self._get_file_path(symbol, ts)
-                    schema = {
-                        "e": pl.Utf8,
-                        "lastUpdateId": pl.UInt64,
-                        "E": pl.UInt64,
-                        "T": pl.UInt64,
-                        "U": pl.UInt64,
-                        "u": pl.UInt64,
-                        "pu": pl.UInt64,
-                        "bids": pl.Utf8,
-                        "asks": pl.Utf8,
+                    record = {
+                        "e": payload.get("e"),
+                        "lastUpdateId": None,
+                        "E": payload.get("E"),
+                        "T": payload.get("T"),
+                        "U": payload.get("U"),
+                        "u": payload.get("u"),
+                        "pu": payload.get("pu"),
+                        "bids": json.dumps(payload.get("b", [])),
+                        "asks": json.dumps(payload.get("a", [])),
                     }
-                    df = pl.DataFrame(self.buffers[symbol], schema=schema)
-                    if out_path.exists():
-                        df_existing = pl.read_parquet(out_path, schema=schema)
-                        df = pl.concat([df_existing, df])
-                    df.write_parquet(out_path, compression="zstd", compression_level=19)
-                    print(f"Wrote {len(self.buffers[symbol])} records to {out_path}")
-                    # Reset buffer and snapshot for next batch
-                    if is_new_day:
-                        last_records[symbol] = None
-                        snapshots[symbol] = None
-                        # Upload to Hugging Face in background
-                        task = asyncio.create_task(
-                            self.upload_to_huggingface(
-                                out_path, delete_after_upload=True
+
+                    snapshot = snapshots.get(symbol)
+                    if snapshot is None:
+                        snapshot = await self._get_snapshot(symbol)
+                        if snapshot is not None:
+                            snapshots[symbol] = snapshot
+                            self.buffers[symbol].append(snapshot)
+                            print(f"Got initial snapshot for {symbol}")
+                        else:
+                            print(
+                                f"Failed to get initial snapshot for {symbol}, skipping updates until next attempt."
                             )
+                            continue
+
+                    # https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/How-to-manage-a-local-order-book-correctly
+                    # How to manage a local order book correctly
+                    # 4. Drop any event where u is < lastUpdateId in the snapshot.
+                    if record["u"] <= snapshot["lastUpdateId"]:
+                        continue
+
+                    # 5. The first processed event should have U <= lastUpdateId AND u >= lastUpdateId
+                    # U = firstUpdateId (the first update ID) from the WebSocket stream.
+                    # u = finalUpdateId (the last update ID) from the WebSocket stream.
+                    # lastUpdateId = the update ID you got from the REST depth snapshot.
+                    if (
+                        record["U"] <= snapshot["lastUpdateId"]
+                        and record["u"] >= snapshot["lastUpdateId"]
+                    ):
+                        first_event_processed[symbol] = True
+                    if not first_event_processed[symbol]:
+                        continue
+
+                    # 6. While listening to the stream, each new event's pu should be equal to the previous event's u, otherwise initialize the process from step 3.
+                    last_record = last_records.get(symbol)
+                    if last_record is not None:
+                        if record["pu"] != last_record["u"]:
+                            print(
+                                f"Missing update for {symbol}: expected U={last_record['u'] + 1}, got U={record['U']}. Re-syncing snapshot."
+                            )
+                            snapshots[symbol] = None
+                            first_event_processed[symbol] = False
+                            continue
+                    self.buffers[symbol].append(record)
+                    last_records[symbol] = record
+
+                    # If record is for new day, write existing buffer to Parquet and clear buffer
+                    is_new_day = False
+                    if last_record is not None:
+                        last_record_day = date.fromtimestamp(last_record["E"] // 1000)
+                        record_day = date.fromtimestamp(record["E"] // 1000)
+                        if record_day != last_record_day:
+                            is_new_day = True
+                    # Write to Parquet in batches
+                    if is_new_day or len(self.buffers[symbol]) >= self.batch_size:
+                        # Use timestamp from first record in batch
+                        ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
+                        out_path = self._get_file_path(symbol, ts)
+                        schema = {
+                            "e": pl.Utf8,
+                            "lastUpdateId": pl.UInt64,
+                            "E": pl.UInt64,
+                            "T": pl.UInt64,
+                            "U": pl.UInt64,
+                            "u": pl.UInt64,
+                            "pu": pl.UInt64,
+                            "bids": pl.Utf8,
+                            "asks": pl.Utf8,
+                        }
+                        df = pl.DataFrame(self.buffers[symbol], schema=schema)
+                        if out_path.exists():
+                            df_existing = pl.read_parquet(out_path, schema=schema)
+                            df = pl.concat([df_existing, df])
+                        df.write_parquet(
+                            out_path, compression="zstd", compression_level=19
                         )
-                        self._upload_tasks.add(task)
-                        task.add_done_callback(self._upload_tasks.discard)
-                    self.buffers[symbol].clear()
+                        print(
+                            f"Wrote {len(self.buffers[symbol])} records to {out_path}"
+                        )
+                        # Reset buffer and snapshot for next batch
+                        if is_new_day:
+                            last_records[symbol] = None
+                            snapshots[symbol] = None
+                            # Upload to Hugging Face in background
+                            task = asyncio.create_task(
+                                self.upload_to_huggingface(
+                                    out_path, delete_after_upload=True
+                                )
+                            )
+                            self._upload_tasks.add(task)
+                            task.add_done_callback(self._upload_tasks.discard)
+                        self.buffers[symbol].clear()
+            finally:
+                pong_task.cancel()
+                await asyncio.gather(pong_task, return_exceptions=True)
 
     async def _send_pong(self, ws: websockets.ClientConnection):
         try:

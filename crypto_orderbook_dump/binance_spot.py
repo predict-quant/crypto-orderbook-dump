@@ -83,8 +83,9 @@ class BinanceSpotOrderBookDumper:
         first_event_U = {}  # symbol -> U of first buffered event after (re-)connect
         event_queues = {symbol: [] for symbol in self.symbols}  # pre-snapshot buffer
 
-        async with websockets.connect(url) as ws:
-            # websockets library automatically responds to server ping frames
+        async with websockets.connect(url, ping_interval=None) as ws:
+            # ping_interval=None disables client-initiated pings; the library
+            # still auto-responds to server ping frames with pong frames.
             print("WebSocket connection established.")
 
             async for msg in ws:
