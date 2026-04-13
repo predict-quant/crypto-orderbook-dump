@@ -21,7 +21,6 @@ load_dotenv()
 class BinanceSpotOrderBookDumper:
     BASE_URL = "wss://stream.binance.com:9443"
     MAX_CONN_HOURS = 23.5  # reconnect before 24h forced disconnect
-    # Spot: server sends ping every 20s, websockets library auto-responds with pong
     MAX_MSGS_PER_SEC = 10
 
     MAX_UPLOAD_RETRIES = 3
@@ -64,6 +63,11 @@ class BinanceSpotOrderBookDumper:
         while not self._stop:
             try:
                 await self._run_once()
+            except websockets.exceptions.ConnectionClosed as e:
+                print(
+                    f"[WARN] WebSocket connection closed: {e}. Reconnecting in 10 seconds..."
+                )
+                await asyncio.sleep(10)
             except Exception as e:
                 print(f"[ERROR] {e}")
                 import traceback
@@ -83,9 +87,11 @@ class BinanceSpotOrderBookDumper:
         first_event_U = {}  # symbol -> U of first buffered event after (re-)connect
         event_queues = {symbol: [] for symbol in self.symbols}  # pre-snapshot buffer
 
-        async with websockets.connect(url, ping_interval=None) as ws:
-            # ping_interval=None disables client-initiated pings; the library
-            # still auto-responds to server ping frames with pong frames.
+        async with websockets.connect(url, ping_interval=20, ping_timeout=None) as ws:
+            # ping_interval=20 enables the keepalive mechanism so the library
+            # responds automatically to server ping frames with pong frames.
+            # ping_timeout=None disables the client-side pong-timeout so high-
+            # latency spikes don't drop the connection prematurely.
             print("WebSocket connection established.")
 
             async for msg in ws:
