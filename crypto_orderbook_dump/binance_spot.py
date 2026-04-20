@@ -9,9 +9,10 @@ from datetime import date
 from os import PathLike
 from pathlib import Path
 
-import aiohttp
 import polars as pl
-import websockets
+from binance_common.configuration import ConfigurationWebSocketStreams
+from binance_sdk_spot.spot import Spot
+from binance_sdk_spot.websocket_streams.models import DiffBookDepthResponse
 from dotenv import load_dotenv
 from huggingface_hub import login, upload_file
 
@@ -19,7 +20,6 @@ load_dotenv()
 
 
 class BinanceSpotOrderBookDumper:
-    BASE_URL = "wss://stream.binance.com:9443"
     MAX_CONN_HOURS = 23.5  # reconnect before 24h forced disconnect
     MAX_MSGS_PER_SEC = 10
 
@@ -42,14 +42,7 @@ class BinanceSpotOrderBookDumper:
         self._hf_logged_in = False
         self._upload_tasks: set[asyncio.Task] = set()
         self._stop = False
-
-    def make_stream_name(self, symbol):
-        return f"{symbol.lower()}@depth@100ms"
-
-    def build_url(self):
-        streams = "/".join([self.make_stream_name(s) for s in self.symbols])
-        url = f"{self.BASE_URL}/stream?streams={streams}"
-        return url
+        self._rest_client = Spot()
 
     def _hf_login(self):
         if not self._hf_logged_in and self.huggingface_token:
@@ -63,11 +56,6 @@ class BinanceSpotOrderBookDumper:
         while not self._stop:
             try:
                 await self._run_once()
-            except websockets.exceptions.ConnectionClosed as e:
-                print(
-                    f"[WARN] WebSocket connection closed: {e}. Reconnecting in 10 seconds..."
-                )
-                await asyncio.sleep(10)
             except Exception as e:
                 print(f"[ERROR] {e}")
                 import traceback
@@ -77,8 +65,6 @@ class BinanceSpotOrderBookDumper:
                 await asyncio.sleep(10)
 
     async def _run_once(self):
-        url = self.build_url()
-        print(f"Connecting to {url}")
         start_time = time.time()
 
         # Per-symbol state
@@ -86,25 +72,43 @@ class BinanceSpotOrderBookDumper:
         last_records = {}  # symbol -> last applied record
         first_event_U = {}  # symbol -> U of first buffered event after (re-)connect
         event_queues = {symbol: [] for symbol in self.symbols}  # pre-snapshot buffer
+        msg_queues: dict[str, asyncio.Queue[DiffBookDepthResponse]] = {
+            symbol: asyncio.Queue() for symbol in self.symbols
+        }
 
-        async with websockets.connect(url, ping_interval=20, ping_timeout=None) as ws:
-            # ping_interval=20 enables the keepalive mechanism so the library
-            # responds automatically to server ping frames with pong frames.
-            # ping_timeout=None disables the client-side pong-timeout so high-
-            # latency spikes don't drop the connection prematurely.
-            print("WebSocket connection established.")
+        ws_client = Spot(config_ws_streams=ConfigurationWebSocketStreams())
+        print("Connecting to Binance WebSocket Streams...")
+        connection = await ws_client.websocket_streams.create_connection()
+        if connection is None:
+            raise ConnectionError("Failed to establish WebSocket connection.")
+        print("WebSocket connection established.")
 
-            async for msg in ws:
+        for symbol in self.symbols:
+            stream = await connection.diff_book_depth(
+                symbol.lower(), update_speed="100ms"
+            )
+
+            def make_callback(sym: str):
+                def callback(data: DiffBookDepthResponse) -> None:
+                    msg_queues[sym].put_nowait(data)
+
+                return callback
+
+            stream.on("message", make_callback(symbol))
+
+        async def process_symbol(symbol: str) -> None:
+            queue = msg_queues[symbol]
+            while not self._stop:
                 # Reconnect before 24h forced disconnect
                 if time.time() - start_time > self.MAX_CONN_HOURS * 3600:
                     print("Reconnecting before 24h forced disconnect.")
-                    break
+                    return
 
-                data = json.loads(msg)
-                payload = data.get("data", {})
-                stream = data.get("stream", "")
-                symbol = stream.split("@", 1)[0].upper()
-                if symbol not in self.buffers:
+                try:
+                    data: DiffBookDepthResponse = await asyncio.wait_for(
+                        queue.get(), timeout=1.0
+                    )
+                except asyncio.TimeoutError:
                     continue
 
                 # Spot diff-depth payload:
@@ -112,13 +116,13 @@ class BinanceSpotOrderBookDumper:
                 # b (bids), a (asks)
                 # NOTE: no T (trade time) or pu (prev update ID) in spot
                 record = {
-                    "e": payload.get("e"),
+                    "e": data.e,
                     "lastUpdateId": None,
-                    "E": payload.get("E"),
-                    "U": payload.get("U"),
-                    "u": payload.get("u"),
-                    "bids": json.dumps(payload.get("b", [])),
-                    "asks": json.dumps(payload.get("a", [])),
+                    "E": data.E,
+                    "U": data.U,
+                    "u": data.u,
+                    "bids": json.dumps(data.b or []),
+                    "asks": json.dumps(data.a or []),
                 }
 
                 snapshot = snapshots.get(symbol)
@@ -159,7 +163,6 @@ class BinanceSpotOrderBookDumper:
                 self._apply_record(symbol, record, snapshot, last_records)
 
                 # Flush buffer on new day or batch size reached
-                _last_record = last_records.get(symbol)
                 is_new_day = False
                 prev_record = (
                     self.buffers[symbol][-1] if len(self.buffers[symbol]) > 1 else None
@@ -201,6 +204,11 @@ class BinanceSpotOrderBookDumper:
                         task.add_done_callback(self._upload_tasks.discard)
                     self.buffers[symbol].clear()
 
+        try:
+            await asyncio.gather(*[process_symbol(s) for s in self.symbols])
+        finally:
+            await connection.close_connection(close_session=True)
+
     def _apply_record(self, symbol, record, snapshot, last_records):
         """Apply a single diff-depth record to the buffer following the spot sync rules."""
         last_updateid = snapshot["lastUpdateId"]
@@ -236,24 +244,28 @@ class BinanceSpotOrderBookDumper:
         last_records[symbol] = record
 
     async def _get_snapshot(self, symbol):
-        url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={self.depth}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    record = {
-                        "e": "snapshot",
-                        "lastUpdateId": data.get("lastUpdateId"),
-                        "E": None,
-                        "U": None,
-                        "u": None,
-                        "bids": json.dumps(data.get("bids", [])),
-                        "asks": json.dumps(data.get("asks", [])),
-                    }
-                    return record
-                else:
-                    print(f"Failed to get snapshot for {symbol}: {resp.status}")
-                    return None
+        loop = asyncio.get_running_loop()
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    self._rest_client.rest_api.depth, symbol, limit=self.depth
+                ),
+            )
+            data = resp.data()
+            record = {
+                "e": "snapshot",
+                "lastUpdateId": data.last_update_id,
+                "E": None,
+                "U": None,
+                "u": None,
+                "bids": json.dumps(data.bids or []),
+                "asks": json.dumps(data.asks or []),
+            }
+            return record
+        except Exception as e:
+            print(f"Failed to get snapshot for {symbol}: {e}")
+            return None
 
     async def _get_snapshot_with_retry(self, symbol, first_event_U):
         """
