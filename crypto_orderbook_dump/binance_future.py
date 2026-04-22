@@ -32,7 +32,6 @@ class BinanceOrderBookDumper:
     ):
         self.symbols = symbols
         self.depth = depth
-        self.output_dir = output_dir
         self.batch_size = batch_size
         self.buffers = {symbol: [] for symbol in symbols}
         self.output_dir = Path(output_dir)
@@ -277,21 +276,39 @@ class BinanceOrderBookDumper:
         self._hf_login()
         upload_file(
             path_or_fileobj=str(file_path),
-            path_in_repo=f"{file_path.parent.name}/{file_path.name}",
+            path_in_repo=str(file_path.relative_to(self.output_dir)),
             repo_id="predict-quant/binance-orderbook",
             repo_type="dataset",
         )
 
+    def _migrate_flat_files(self):
+        """Move flat symbol/file.parquet files into symbol/year/month/file.parquet."""
+        for symbol_dir in self.output_dir.iterdir():
+            if not symbol_dir.is_dir():
+                continue
+            for f in list(symbol_dir.glob("*.parquet")):
+                try:
+                    date_str = f.name.split("_")[0]
+                    year, month, _ = date_str.split("-")
+                    new_dir = symbol_dir / year / month
+                    new_dir.mkdir(parents=True, exist_ok=True)
+                    new_path = new_dir / f.name
+                    f.rename(new_path)
+                    print(f"[MIGRATE] Moved {f.name} -> {new_path}")
+                except Exception as e:
+                    print(f"[MIGRATE] Failed to migrate {f}: {e}")
+
     async def _retry_leftover_uploads(self):
-        """Upload parquet files left over from previous failed uploads."""
+        """Migrate flat files and upload parquet files left over from previous failed uploads."""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_flat_files()
         if not self.huggingface_token:
             return
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         today_str = time.strftime("%Y-%m-%d", time.gmtime())
         for symbol_dir in self.output_dir.iterdir():
             if not symbol_dir.is_dir():
                 continue
-            for f in sorted(symbol_dir.glob("*.parquet")):
+            for f in sorted(symbol_dir.rglob("*.parquet")):
                 # Skip today's file — it may still be written to
                 if f.name.startswith(today_str):
                     continue
@@ -302,11 +319,14 @@ class BinanceOrderBookDumper:
         dt = time.gmtime(timestamp // 1000)
         date_str = f"{dt.tm_year:04d}-{dt.tm_mon:02d}-{dt.tm_mday:02d}"
         out_path: Path = (
-            self.output_dir / symbol / f"{date_str}_{symbol}_depth{self.depth}.parquet"
+            self.output_dir
+            / symbol
+            / f"{dt.tm_year:04d}"
+            / f"{dt.tm_mon:02d}"
+            / f"{date_str}_{symbol}_depth{self.depth}.parquet"
         )
         print(f"Generated file path: {out_path}")
         out_path.parent.mkdir(parents=True, exist_ok=True)
-
         return out_path
 
     def stop(self):
