@@ -159,14 +159,15 @@ class BinanceSpotOrderBookDumper:
                     first_event_U.pop(symbol, None)
                     continue
 
+                # Capture the last buffered record BEFORE applying the current one
+                # so we can compare days correctly.
+                prev_record = self.buffers[symbol][-1] if self.buffers[symbol] else None
+
                 # Normal path: apply live event
                 self._apply_record(symbol, record, snapshot, last_records)
 
                 # Flush buffer on new day or batch size reached
                 is_new_day = False
-                prev_record = (
-                    self.buffers[symbol][-1] if len(self.buffers[symbol]) > 1 else None
-                )
                 if prev_record is not None and prev_record["e"] != "snapshot":
                     last_day = date.fromtimestamp(prev_record["E"] // 1000)
                     cur_day = date.fromtimestamp(record["E"] // 1000)
