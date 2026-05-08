@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import functools
 import json
+import logging
 import os
 import time
 from datetime import date
@@ -12,6 +13,7 @@ from pathlib import Path
 import polars as pl
 from binance_common.configuration import ConfigurationWebSocketStreams
 from binance_sdk_spot.spot import Spot
+from binance_sdk_spot.websocket_streams import SpotWebSocketStreams
 from binance_sdk_spot.websocket_streams.models import DiffBookDepthResponse
 from dotenv import load_dotenv
 from huggingface_hub import login, upload_file
@@ -57,11 +59,11 @@ class BinanceSpotOrderBookDumper:
             try:
                 await self._run_once()
             except Exception as e:
-                print(f"[ERROR] {e}")
+                logging.error(f"[ERROR] {e}")
                 import traceback
 
                 traceback.print_exc()
-                print("Reconnecting in 10 seconds...")
+                logging.info("Reconnecting in 10 seconds...")
                 await asyncio.sleep(10)
 
     async def _run_once(self):
@@ -77,11 +79,13 @@ class BinanceSpotOrderBookDumper:
         }
 
         ws_client = Spot(config_ws_streams=ConfigurationWebSocketStreams())
-        print("Connecting to Binance WebSocket Streams...")
-        connection = await ws_client.websocket_streams.create_connection()
+        logging.info("Connecting to Binance WebSocket Streams...")
+        connection: (
+            SpotWebSocketStreams | None
+        ) = await ws_client.websocket_streams.create_connection()
         if connection is None:
             raise ConnectionError("Failed to establish WebSocket connection.")
-        print("WebSocket connection established.")
+        logging.info("WebSocket connection established.")
 
         for symbol in self.symbols:
             stream = await connection.diff_book_depth(
@@ -101,7 +105,7 @@ class BinanceSpotOrderBookDumper:
             while not self._stop:
                 # Reconnect before 24h forced disconnect
                 if time.time() - start_time > self.MAX_CONN_HOURS * 3600:
-                    print("Reconnecting before 24h forced disconnect.")
+                    logging.info("Reconnecting before 24h forced disconnect.")
                     return
 
                 try:
@@ -138,7 +142,7 @@ class BinanceSpotOrderBookDumper:
                         symbol, first_event_U[symbol]
                     )
                     if snapshot is None:
-                        print(
+                        logging.warning(
                             f"Failed to get a valid snapshot for {symbol} after "
                             f"{self.MAX_SNAPSHOT_RETRIES} retries. Dropping buffered events."
                         )
@@ -148,7 +152,7 @@ class BinanceSpotOrderBookDumper:
 
                     snapshots[symbol] = snapshot
                     self.buffers[symbol].append(snapshot)
-                    print(
+                    logging.info(
                         f"Got initial snapshot for {symbol} (lastUpdateId={snapshot['lastUpdateId']})"
                     )
 
@@ -191,7 +195,9 @@ class BinanceSpotOrderBookDumper:
                         df_existing = pl.read_parquet(out_path, schema=schema)
                         df = pl.concat([df_existing, df])
                     df.write_parquet(out_path, compression="zstd", compression_level=19)
-                    print(f"Wrote {len(self.buffers[symbol])} records to {out_path}")
+                    logging.debug(
+                        f"Wrote {len(self.buffers[symbol])} records to {out_path}"
+                    )
 
                     if is_new_day:
                         last_records[symbol] = None
@@ -224,7 +230,7 @@ class BinanceSpotOrderBookDumper:
         if last_record is None:
             # Validate first event: U must be <= lastUpdateId + 1
             if record["U"] > last_updateid + 1:
-                print(
+                logging.warning(
                     f"Gap detected for {symbol}: snapshot lastUpdateId={last_updateid} "
                     f"but first event U={record['U']}. Will re-sync on next iteration."
                 )
@@ -234,7 +240,7 @@ class BinanceSpotOrderBookDumper:
         else:
             # Subsequent events: U of this event must equal u of last event + 1
             if record["U"] != last_record["u"] + 1:
-                print(
+                logging.warning(
                     f"Gap detected for {symbol}: expected U={last_record['u'] + 1}, "
                     f"got U={record['U']}. Re-syncing snapshot."
                 )
@@ -265,7 +271,7 @@ class BinanceSpotOrderBookDumper:
             }
             return record
         except Exception as e:
-            print(f"Failed to get snapshot for {symbol}: {e}")
+            logging.error(f"Failed to get snapshot for {symbol}: {e}")
             return None
 
     async def _get_snapshot_with_retry(self, symbol, first_event_U):
@@ -280,7 +286,7 @@ class BinanceSpotOrderBookDumper:
                 continue
             if snapshot["lastUpdateId"] >= first_event_U:
                 return snapshot
-            print(
+            logging.debug(
                 f"[{symbol}] Snapshot lastUpdateId={snapshot['lastUpdateId']} < "
                 f"first buffered U={first_event_U}. Retrying snapshot "
                 f"(attempt {attempt}/{self.MAX_SNAPSHOT_RETRIES})."
@@ -290,7 +296,7 @@ class BinanceSpotOrderBookDumper:
 
     async def upload_to_huggingface(self, file_path: Path, delete_after_upload=False):
         if not self.huggingface_token:
-            print("Hugging Face token not found. Skipping upload.")
+            logging.warning("Hugging Face token not found. Skipping upload.")
             return False
 
         loop = asyncio.get_running_loop()
@@ -301,20 +307,20 @@ class BinanceSpotOrderBookDumper:
                     None,
                     functools.partial(self._upload_file_sync, file_path),
                 )
-                print(f"Uploaded {file_path} to Hugging Face.")
+                logging.info(f"Uploaded {file_path} to Hugging Face.")
                 if delete_after_upload:
                     file_path.unlink()
-                    print(f"Deleted local file {file_path} after upload.")
+                    logging.debug(f"Deleted local file {file_path} after upload.")
                 return True
             except Exception as e:
-                print(
+                logging.warning(
                     f"[Attempt {attempt}/{self.MAX_UPLOAD_RETRIES}] "
                     f"Failed to upload {file_path}: {e}"
                 )
                 if attempt < self.MAX_UPLOAD_RETRIES:
                     await asyncio.sleep(self.UPLOAD_RETRY_DELAY * attempt)
 
-        print(
+        logging.error(
             f"Giving up uploading {file_path} after {self.MAX_UPLOAD_RETRIES} attempts."
         )
         return False
@@ -342,9 +348,9 @@ class BinanceSpotOrderBookDumper:
                     new_dir.mkdir(parents=True, exist_ok=True)
                     new_path = new_dir / f.name
                     f.rename(new_path)
-                    print(f"[MIGRATE] Moved {f.name} -> {new_path}")
+                    logging.info(f"[MIGRATE] Moved {f.name} -> {new_path}")
                 except Exception as e:
-                    print(f"[MIGRATE] Failed to migrate {f}: {e}")
+                    logging.error(f"[MIGRATE] Failed to migrate {f}: {e}")
 
     async def _retry_leftover_uploads(self):
         """Migrate flat files and upload parquet files left over from previous failed uploads."""
@@ -360,7 +366,7 @@ class BinanceSpotOrderBookDumper:
                 # Skip today's file — it may still be written to
                 if f.name.startswith(today_str):
                     continue
-                print(f"[RETRY] Uploading leftover file {f}")
+                logging.info(f"[RETRY] Uploading leftover file {f}")
                 await self.upload_to_huggingface(f, delete_after_upload=True)
 
     def _get_file_path(self, symbol, timestamp) -> Path:
@@ -411,6 +417,11 @@ def parse_args():
 
 async def main():
     args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="[%(asctime)s] %(levelname)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     client = BinanceSpotOrderBookDumper(
         args.symbols, args.depth, args.output, args.batch_size
     )
