@@ -24,6 +24,7 @@ load_dotenv()
 class BinanceSpotOrderBookDumper:
     MAX_CONN_HOURS = 23.5  # reconnect before 24h forced disconnect
     MAX_MSGS_PER_SEC = 10
+    STALE_STREAM_SECONDS = 300  # force reconnect if no message arrives for 5 min
 
     MAX_UPLOAD_RETRIES = 3
     UPLOAD_RETRY_DELAY = 30  # seconds between retries
@@ -77,6 +78,7 @@ class BinanceSpotOrderBookDumper:
         msg_queues: dict[str, asyncio.Queue[DiffBookDepthResponse]] = {
             symbol: asyncio.Queue() for symbol in self.symbols
         }
+        last_msg_at = {symbol: time.time() for symbol in self.symbols}
 
         ws_client = Spot(config_ws_streams=ConfigurationWebSocketStreams())
         logging.info("Connecting to Binance WebSocket Streams...")
@@ -94,6 +96,7 @@ class BinanceSpotOrderBookDumper:
 
             def make_callback(sym: str):
                 def callback(data: DiffBookDepthResponse) -> None:
+                    last_msg_at[sym] = time.time()
                     msg_queues[sym].put_nowait(data)
 
                 return callback
@@ -113,6 +116,12 @@ class BinanceSpotOrderBookDumper:
                         queue.get(), timeout=1.0
                     )
                 except asyncio.TimeoutError:
+                    stale_for = time.time() - last_msg_at[symbol]
+                    if stale_for > self.STALE_STREAM_SECONDS:
+                        raise ConnectionError(
+                            f"[{symbol}] WebSocket stream stale for {stale_for:.1f}s "
+                            f"(threshold={self.STALE_STREAM_SECONDS}s)."
+                        )
                     continue
 
                 # Spot diff-depth payload:
@@ -213,7 +222,10 @@ class BinanceSpotOrderBookDumper:
 
         try:
             await asyncio.gather(*[process_symbol(s) for s in self.symbols])
+        except Exception as e:
+            logging.error(f"Error in processing loop: {e}")
         finally:
+            logging.info("Closing WebSocket connection.")
             await connection.close_connection(close_session=True)
 
     def _apply_record(self, symbol, record, snapshot, last_records):
