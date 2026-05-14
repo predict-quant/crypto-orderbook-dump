@@ -21,6 +21,10 @@ from huggingface_hub import login, upload_file
 load_dotenv()
 
 
+class InvalidSpotSymbolError(Exception):
+    pass
+
+
 class BinanceSpotOrderBookDumper:
     MAX_CONN_HOURS = 23.5  # reconnect before 24h forced disconnect
     MAX_MSGS_PER_SEC = 10
@@ -32,6 +36,7 @@ class BinanceSpotOrderBookDumper:
     # Snapshot is buffered before we start, but if lastUpdateId < U of first
     # buffered event we must re-fetch. We retry up to this many times.
     MAX_SNAPSHOT_RETRIES = 5
+    MAX_STALE_RECOVERY_ATTEMPTS = 3
 
     def __init__(
         self, symbols: list[str], depth: int, output_dir: PathLike, batch_size: int
@@ -46,6 +51,7 @@ class BinanceSpotOrderBookDumper:
         self._upload_tasks: set[asyncio.Task] = set()
         self._stop = False
         self._rest_client = Spot()
+        self._invalid_symbols: set[str] = set()
 
     def _hf_login(self):
         if not self._hf_logged_in and self.huggingface_token:
@@ -53,6 +59,8 @@ class BinanceSpotOrderBookDumper:
             self._hf_logged_in = True
 
     async def run(self):
+        await self._validate_symbols()
+
         # Retry uploading any leftover files from previous runs
         await self._retry_leftover_uploads()
 
@@ -79,6 +87,7 @@ class BinanceSpotOrderBookDumper:
             symbol: asyncio.Queue() for symbol in self.symbols
         }
         last_msg_at = {symbol: time.time() for symbol in self.symbols}
+        stale_recoveries = {symbol: 0 for symbol in self.symbols}
 
         ws_client = Spot(config_ws_streams=ConfigurationWebSocketStreams())
         logging.info("Connecting to Binance WebSocket Streams...")
@@ -118,11 +127,28 @@ class BinanceSpotOrderBookDumper:
                 except asyncio.TimeoutError:
                     stale_for = time.time() - last_msg_at[symbol]
                     if stale_for > self.STALE_STREAM_SECONDS:
-                        raise ConnectionError(
+                        stale_recoveries[symbol] += 1
+                        logging.warning(
                             f"[{symbol}] WebSocket stream stale for {stale_for:.1f}s "
-                            f"(threshold={self.STALE_STREAM_SECONDS}s)."
+                            f"(threshold={self.STALE_STREAM_SECONDS}s, "
+                            f"attempt={stale_recoveries[symbol]}/{self.MAX_STALE_RECOVERY_ATTEMPTS})."
                         )
+                        if stale_recoveries[symbol] >= self.MAX_STALE_RECOVERY_ATTEMPTS:
+                            raise ConnectionError(
+                                f"[{symbol}] WebSocket stream stale for {stale_for:.1f}s "
+                                f"after {self.MAX_STALE_RECOVERY_ATTEMPTS} recovery attempts."
+                            )
+
+                        # Isolate stale symbols so one dead stream does not
+                        # immediately force reconnect for all symbols.
+                        last_msg_at[symbol] = time.time()
+                        snapshots[symbol] = None
+                        last_records[symbol] = None
+                        event_queues[symbol].clear()
+                        first_event_U.pop(symbol, None)
                     continue
+
+                stale_recoveries[symbol] = 0
 
                 # Spot diff-depth payload:
                 # e, E (event time), s (symbol), U (first update ID), u (final update ID)
@@ -139,6 +165,13 @@ class BinanceSpotOrderBookDumper:
                 }
 
                 snapshot = snapshots.get(symbol)
+
+                if snapshot is not None and snapshot["lastUpdateId"] < 0:
+                    snapshots[symbol] = None
+                    last_records[symbol] = None
+                    event_queues[symbol].clear()
+                    first_event_U.pop(symbol, None)
+                    snapshot = None
 
                 if snapshot is None:
                     # Buffer events while we (re-)fetch the snapshot.
@@ -283,8 +316,42 @@ class BinanceSpotOrderBookDumper:
             }
             return record
         except Exception as e:
+            if "-1121" in str(e) or "Invalid symbol" in str(e):
+                self._invalid_symbols.add(symbol)
+                raise InvalidSpotSymbolError(
+                    f"{symbol} is not a valid Binance spot symbol"
+                )
             logging.error(f"Failed to get snapshot for {symbol}: {e}")
             return None
+
+    async def _validate_symbols(self):
+        valid_symbols: list[str] = []
+
+        for symbol in self.symbols:
+            try:
+                snapshot = await self._get_snapshot(symbol)
+            except InvalidSpotSymbolError:
+                logging.error(
+                    f"[{symbol}] Invalid Binance spot symbol. It will be excluded."
+                )
+                continue
+
+            if snapshot is None:
+                logging.warning(
+                    f"[{symbol}] Snapshot validation failed at startup. Keeping symbol and retrying in stream loop."
+                )
+            valid_symbols.append(symbol)
+
+        if not valid_symbols:
+            raise ValueError("No valid symbols available for Binance spot streams.")
+
+        removed = sorted(set(self.symbols) - set(valid_symbols))
+        if removed:
+            logging.warning(f"Excluded invalid symbols: {', '.join(removed)}")
+            self.buffers = {
+                symbol: self.buffers.get(symbol, []) for symbol in valid_symbols
+            }
+            self.symbols = valid_symbols
 
     async def _get_snapshot_with_retry(self, symbol, first_event_U):
         """
