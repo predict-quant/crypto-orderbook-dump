@@ -99,6 +99,7 @@ class BinanceSpotOrderBookDumper:
         logging.info("WebSocket connection established.")
 
         for symbol in self.symbols:
+            logging.info(f"Subscribing to diff book depth stream for {symbol}...")
             stream = await connection.diff_book_depth(
                 symbol.lower(), update_speed="100ms"
             )
@@ -111,6 +112,8 @@ class BinanceSpotOrderBookDumper:
                 return callback
 
             stream.on("message", make_callback(symbol))
+
+        logging.info("Starting main processing loop...")
 
         async def process_symbol(symbol: str) -> None:
             queue = msg_queues[symbol]
@@ -497,7 +500,7 @@ def parse_args():
 async def main():
     args = parse_args()
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="[%(asctime)s] %(levelname)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
