@@ -210,25 +210,7 @@ class BinanceSpotOrderBookDumper:
                     continue
 
                 record_day = date.fromtimestamp(record["E"] // 1000)
-                prev_day = active_day[symbol]
-
-                # Handle UTC day rollover even when the in-memory buffer is empty.
-                if prev_day is None:
-                    active_day[symbol] = record_day
-                elif record_day != prev_day:
-                    self._flush_symbol_buffer(symbol)
-
-                    prev_day_path = self._get_file_path_for_day(symbol, prev_day)
-                    if prev_day_path.exists():
-                        task = asyncio.create_task(
-                            self.upload_to_huggingface(
-                                prev_day_path, delete_after_upload=True
-                            )
-                        )
-                        self._upload_tasks.add(task)
-                        task.add_done_callback(self._upload_tasks.discard)
-
-                    active_day[symbol] = record_day
+                self._handle_day_rollover(symbol, record_day, active_day)
 
                 # Normal path: apply live event
                 self._apply_record(symbol, record, snapshot, last_records)
@@ -366,6 +348,34 @@ class BinanceSpotOrderBookDumper:
             "bids": pl.Utf8,
             "asks": pl.Utf8,
         }
+
+    def _handle_day_rollover(
+        self,
+        symbol: str,
+        record_day: date,
+        active_day: dict[str, date | None],
+    ) -> None:
+        prev_day = active_day[symbol]
+
+        if prev_day is None:
+            active_day[symbol] = record_day
+            return
+
+        if record_day == prev_day:
+            return
+
+        # Flush pending rows first so the previous day's parquet is complete.
+        self._flush_symbol_buffer(symbol)
+
+        prev_day_path = self._get_file_path_for_day(symbol, prev_day)
+        if prev_day_path.exists():
+            task = asyncio.create_task(
+                self.upload_to_huggingface(prev_day_path, delete_after_upload=True)
+            )
+            self._upload_tasks.add(task)
+            task.add_done_callback(self._upload_tasks.discard)
+
+        active_day[symbol] = record_day
 
     def _flush_symbol_buffer(self, symbol: str) -> Path | None:
         if not self.buffers[symbol]:
