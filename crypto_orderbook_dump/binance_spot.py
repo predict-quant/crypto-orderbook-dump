@@ -86,6 +86,7 @@ class BinanceSpotOrderBookDumper:
         msg_queues: dict[str, asyncio.Queue[DiffBookDepthResponse]] = {
             symbol: asyncio.Queue() for symbol in self.symbols
         }
+        active_day: dict[str, date | None] = {symbol: None for symbol in self.symbols}
         last_msg_at = {symbol: time.time() for symbol in self.symbols}
         stale_recoveries = {symbol: 0 for symbol in self.symbols}
 
@@ -208,53 +209,32 @@ class BinanceSpotOrderBookDumper:
                     first_event_U.pop(symbol, None)
                     continue
 
-                # Capture the last buffered record BEFORE applying the current one
-                # so we can compare days correctly.
-                prev_record = self.buffers[symbol][-1] if self.buffers[symbol] else None
+                record_day = date.fromtimestamp(record["E"] // 1000)
+                prev_day = active_day[symbol]
 
-                # Normal path: apply live event
-                self._apply_record(symbol, record, snapshot, last_records)
+                # Handle UTC day rollover even when the in-memory buffer is empty.
+                if prev_day is None:
+                    active_day[symbol] = record_day
+                elif record_day != prev_day:
+                    self._flush_symbol_buffer(symbol)
 
-                # Flush buffer on new day or batch size reached
-                is_new_day = False
-                if prev_record is not None and prev_record["e"] != "snapshot":
-                    last_day = date.fromtimestamp(prev_record["E"] // 1000)
-                    cur_day = date.fromtimestamp(record["E"] // 1000)
-                    if cur_day != last_day:
-                        is_new_day = True
-
-                if is_new_day or len(self.buffers[symbol]) >= self.batch_size:
-                    ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
-                    out_path = self._get_file_path(symbol, ts)
-                    schema = {
-                        "e": pl.Utf8,
-                        "lastUpdateId": pl.UInt64,
-                        "E": pl.UInt64,
-                        "U": pl.UInt64,
-                        "u": pl.UInt64,
-                        "bids": pl.Utf8,
-                        "asks": pl.Utf8,
-                    }
-                    df = pl.DataFrame(self.buffers[symbol], schema=schema)
-                    if out_path.exists():
-                        df_existing = pl.read_parquet(out_path, schema=schema)
-                        df = pl.concat([df_existing, df])
-                    df.write_parquet(out_path, compression="zstd", compression_level=19)
-                    logging.debug(
-                        f"Wrote {len(self.buffers[symbol])} records to {out_path}"
-                    )
-
-                    if is_new_day:
-                        last_records[symbol] = None
-                        snapshots[symbol] = None
+                    prev_day_path = self._get_file_path_for_day(symbol, prev_day)
+                    if prev_day_path.exists():
                         task = asyncio.create_task(
                             self.upload_to_huggingface(
-                                out_path, delete_after_upload=True
+                                prev_day_path, delete_after_upload=True
                             )
                         )
                         self._upload_tasks.add(task)
                         task.add_done_callback(self._upload_tasks.discard)
-                    self.buffers[symbol].clear()
+
+                    active_day[symbol] = record_day
+
+                # Normal path: apply live event
+                self._apply_record(symbol, record, snapshot, last_records)
+
+                if len(self.buffers[symbol]) >= self.batch_size:
+                    self._flush_symbol_buffer(symbol)
 
         try:
             await asyncio.gather(*[process_symbol(s) for s in self.symbols])
@@ -376,6 +356,35 @@ class BinanceSpotOrderBookDumper:
             await asyncio.sleep(0.5)
         return None
 
+    def _spot_schema(self):
+        return {
+            "e": pl.Utf8,
+            "lastUpdateId": pl.UInt64,
+            "E": pl.UInt64,
+            "U": pl.UInt64,
+            "u": pl.UInt64,
+            "bids": pl.Utf8,
+            "asks": pl.Utf8,
+        }
+
+    def _flush_symbol_buffer(self, symbol: str) -> Path | None:
+        if not self.buffers[symbol]:
+            return None
+
+        ts = self.buffers[symbol][0].get("E") or int(time.time() * 1000)
+        out_path = self._get_file_path(symbol, ts)
+        schema = self._spot_schema()
+        df = pl.DataFrame(self.buffers[symbol], schema=schema)
+
+        if out_path.exists():
+            df_existing = pl.read_parquet(out_path, schema=schema)
+            df = pl.concat([df_existing, df])
+
+        df.write_parquet(out_path, compression="zstd", compression_level=19)
+        logging.debug(f"Wrote {len(self.buffers[symbol])} records to {out_path}")
+        self.buffers[symbol].clear()
+        return out_path
+
     async def upload_to_huggingface(self, file_path: Path, delete_after_upload=False):
         if not self.huggingface_token:
             logging.warning("Hugging Face token not found. Skipping upload.")
@@ -460,6 +469,17 @@ class BinanceSpotOrderBookDumper:
             / f"{dt.tm_year:04d}"
             / f"{dt.tm_mon:02d}"
             / f"{date_str}_{symbol}_depth{self.depth}.parquet"
+        )
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        return out_path
+
+    def _get_file_path_for_day(self, symbol: str, day: date) -> Path:
+        out_path: Path = (
+            self.output_dir
+            / symbol
+            / f"{day.year:04d}"
+            / f"{day.month:02d}"
+            / f"{day.isoformat()}_{symbol}_depth{self.depth}.parquet"
         )
         out_path.parent.mkdir(parents=True, exist_ok=True)
         return out_path
