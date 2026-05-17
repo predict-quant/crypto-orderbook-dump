@@ -12,6 +12,7 @@ from pathlib import Path
 
 import polars as pl
 from binance_common.configuration import ConfigurationWebSocketStreams
+from binance_common.websocket import global_stream_connections
 from binance_sdk_spot.spot import Spot
 from binance_sdk_spot.websocket_streams import SpotWebSocketStreams
 from binance_sdk_spot.websocket_streams.models import DiffBookDepthResponse
@@ -28,7 +29,7 @@ class InvalidSpotSymbolError(Exception):
 class BinanceSpotOrderBookDumper:
     MAX_CONN_HOURS = 23.5  # reconnect before 24h forced disconnect
     MAX_MSGS_PER_SEC = 10
-    STALE_STREAM_SECONDS = 300  # force reconnect if no message arrives for 5 min
+    STALE_STREAM_SECONDS = 5  # force reconnect if no message arrives
 
     MAX_UPLOAD_RETRIES = 3
     UPLOAD_RETRY_DELAY = 30  # seconds between retries
@@ -224,6 +225,15 @@ class BinanceSpotOrderBookDumper:
             logging.error(f"Error in processing loop: {e}")
         finally:
             logging.info("Closing WebSocket connection.")
+            # Clear the SDK's global stream registry so streams can be
+            # re-subscribed on the next connection. Without this, subscribe()
+            # silently skips streams already present in global_stream_connections
+            # (even though the underlying WebSocket is now closed), causing all
+            # subsequent reconnects to receive no data.
+            for symbol in self.symbols:
+                global_stream_connections.stream_connections_map.pop(
+                    f"{symbol.lower()}@depth@100ms", None
+                )
             await connection.close_connection(close_session=True)
 
     def _apply_record(self, symbol, record, snapshot, last_records):
